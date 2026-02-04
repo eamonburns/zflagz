@@ -1,0 +1,12 @@
+.{
+    .name = .zflagz,
+    .version = "0.0.0",
+    .fingerprint = 0xaf808107b7424b8b, // Changing this has security and trust implications.
+    .minimum_zig_version = "0.16.0-dev.2459+37d14a4f3",
+    .dependencies = .{},
+    .paths = .{
+        "build.zig",
+        "build.zig.zon",
+        "src",
+    },
+}
