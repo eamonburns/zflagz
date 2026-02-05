@@ -1,17 +1,24 @@
 const std = @import("std");
 const mem = std.mem;
 
+const log = std.log.scoped(.zflagz);
+
 pub const Args = struct {
     it: *std.process.Args.Iterator,
     current: ?[:0]const u8,
 
+    gpa: mem.Allocator,
+    help_text: HelpText,
+
     /// You should not use `it` after passing it here,
     /// since the `Args` could have consumed an argument from
     /// `it` without returning it yet.
-    pub fn init(it: *std.process.Args.Iterator) Args {
+    pub fn init(gpa: mem.Allocator, it: *std.process.Args.Iterator) Args {
         return .{
             .it = it,
             .current = null,
+            .gpa = gpa,
+            .help_text = .init,
         };
     }
 
@@ -33,19 +40,24 @@ pub const Args = struct {
     /// false if there are no more arguments, or the next
     /// argument is "--" or doesn't start with "-"
     pub fn moreFlags(args: *Args) bool {
-        const arg = args.peek() orelse return false;
+        const arg = args.peek() orelse {
+            log.debug("{s}: no more arguments", .{@src().fn_name});
+            return false;
+        };
+        log.debug("{s}: argument '{s}'", .{ @src().fn_name, arg });
         if (!std.mem.startsWith(u8, arg, "-")) return false;
         if (std.mem.eql(u8, arg, "--")) {
             _ = args.next(); // Consume the "--"
             return false;
         }
+        args.help_text.sections.clearRetainingCapacity();
 
         return true;
     }
 
     /// Exits with `zflagz.fatal`
     pub fn unknown(args: *Args) noreturn {
-        fatal("unknown argument: {s}", .{args.peek()});
+        fatal("unknown argument: {s}", .{args.peek().?});
     }
 
     /// Checks if the current argument is "--help" or "-h"
@@ -59,11 +71,24 @@ pub const Args = struct {
         return false;
     }
 
+    pub fn exitHelp(args: *Args, status: u8) noreturn {
+        std.debug.print("{f}", .{args.help_text});
+        std.process.exit(status);
+    }
+
     /// Parses an option with a parameter from the current (and possibly subsequent) argument(s).
     /// Returns `null` if the argument doesn't match, or the parameter value on success.
     /// Crashes with `zflagz.fatal` and an error message if the argument matches, but is missing its parameter,
     /// Supports both `--name <value>` and `--name=<value>` forms.
-    pub fn option(args: *Args, name: []const u8) ?[:0]const u8 {
+    pub fn option(args: *Args, name: []const u8, short_name: ?[]const u8, value_syntax: []const u8, description: []const u8) ?[:0]const u8 {
+        args.help_text.addSection(args.gpa, .{
+            .option = .{
+                .name = name,
+                .short_name = short_name,
+                .value_syntax = value_syntax,
+                .description = description,
+            },
+        }) catch @panic("OOM");
         const current = args.peek() orelse return null;
 
         if (!mem.startsWith(u8, current, "--")) return null;
@@ -86,7 +111,15 @@ pub const Args = struct {
 
     /// Parses a flag from the current argument.
     /// Returns `true` if the argument matches `--[name]`, `false` if it matches `--no-[name]`, and `null` if it doesn't match.
-    pub fn flag(args: *Args, name: []const u8) ?bool {
+    pub fn flag(args: *Args, name: []const u8, short_name: ?[]const u8, description: []const u8) ?bool {
+        args.help_text.addSection(args.gpa, .{
+            .flag = .{
+                .name = name,
+                .short_name = short_name,
+                .description = description,
+            },
+        }) catch @panic("OOM");
+
         const current = args.peek() orelse return null;
         if (mem.startsWith(u8, current, "--") and mem.eql(u8, current["--".len..], name)) {
             _ = args.next();
@@ -98,9 +131,14 @@ pub const Args = struct {
 
         return null;
     }
+
+    pub fn setDescription(args: *Args, description: []const u8) void {
+        args.help_text.description = description;
+    }
 };
 
 pub const HelpText = struct {
+    description: []const u8 = "",
     sections: std.ArrayList(Section),
 
     pub const init: HelpText = .{
@@ -111,15 +149,66 @@ pub const HelpText = struct {
         text: []const u8,
         option: struct {
             name: []const u8,
-            short_name: []const u8,
-            value: []const u8,
+            short_name: ?[]const u8,
+            value_syntax: []const u8,
             description: []const u8,
         },
         flag: struct {
             name: []const u8,
+            short_name: ?[]const u8,
             description: []const u8,
         },
     };
+
+    pub fn deinit(ht: HelpText, gpa: mem.Allocator) void {
+        ht.sections.deinit(gpa);
+    }
+
+    pub fn addSection(ht: *HelpText, gpa: mem.Allocator, section: Section) mem.Allocator.Error!void {
+        try ht.sections.append(gpa, section);
+    }
+
+    pub fn format(
+        ht: HelpText,
+        writer: *std.Io.Writer,
+    ) std.Io.Writer.Error!void {
+        // TODO: Usage/synopsis
+
+        try writer.writeAll(ht.description);
+        try writer.writeAll("\n\n");
+
+        try writer.writeAll("Options:\n");
+        for (ht.sections.items) |section| {
+            switch (section) {
+                .text => |text| {
+                    try writer.writeAll(text);
+                    try writer.writeByte('\n');
+                },
+                .option => |option| {
+                    if (option.short_name) |short_name| {
+                        try writer.print("  -{s} {s}\n", .{ short_name, option.value_syntax });
+                    }
+                    try writer.print("  --{s}={s}\n", .{ option.name, option.value_syntax });
+                    var line_start: usize = 0;
+                    while (std.mem.indexOfPos(u8, option.description, line_start, "\n")) |line_end| : (line_start = line_end + 1) {
+                        try writer.print("    {s}\n", .{option.description[line_start..line_end]});
+                    }
+                    try writer.print("    {s}\n\n", .{option.description[line_start..]});
+                },
+                .flag => |flag| {
+                    if (flag.short_name) |short_name| {
+                        try writer.print("  -{s}\n", .{short_name});
+                    }
+                    try writer.print("  --{s}\n", .{flag.name});
+                    var line_start: usize = 0;
+                    while (std.mem.indexOfPos(u8, flag.description, line_start, "\n")) |line_end| : (line_start = line_end + 1) {
+                        try writer.print("    {s}\n", .{flag.description[line_start..line_end]});
+                    }
+                    try writer.print("    {s}\n\n", .{flag.description[line_start..]});
+                },
+            }
+        }
+    }
 };
 
 /// Prints an error message an exits with a non-zero status code
